@@ -16,6 +16,7 @@ import (
 	"github.com/openmcp-project/controller-utils/pkg/clusters"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v2 "ocm.software/open-component-model/bindings/go/descriptor/v2"
 	ocmv1alpha1 "ocm.software/open-component-model/bindings/go/kubernetes/controller/api/v1alpha1"
@@ -187,6 +188,9 @@ func discoveryStatus(object client.Object) objectmanager.ManagedObjectStatus {
 	if discovery.GetGeneration() != discovery.Status.ObservedGeneration {
 		return objectmanager.ManagedObjectStatus{Phase: objectmanager.StatusPhaseProgressing, Message: "Resource has not been reconciled yet."}
 	}
+	if !meta.IsStatusConditionTrue(discovery.GetConditions(), "Ready") {
+		return objectmanager.ManagedObjectStatus{Phase: objectmanager.StatusPhaseProgressing, Message: "Resource is not ready."}
+	}
 	return objectmanager.ManagedObjectStatus{Phase: objectmanager.StatusPhaseReady, Message: "Resource exists."}
 }
 
@@ -343,6 +347,9 @@ func (r *resolver) fetchDiscovery(ctx context.Context, id string) (ocmv1alpha1.D
 	}
 	if discovery.Generation != discovery.Status.ObservedGeneration {
 		return ocmv1alpha1.Discovery{}, fmt.Errorf("discovery %q has not been observed for its current spec", id)
+	}
+	if !meta.IsStatusConditionTrue(discovery.GetConditions(), "Ready") {
+		return ocmv1alpha1.Discovery{}, fmt.Errorf("discovery %q is not ready", id)
 	}
 	return discovery, nil
 }
