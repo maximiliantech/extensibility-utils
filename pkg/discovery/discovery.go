@@ -50,6 +50,8 @@ var (
 type Resolver interface {
 	// Apply creates or updates the Discovery objects on the platform cluster and returns true if a requeue is needed.
 	Apply(ctx context.Context) (bool, error)
+	// Delete deletes the Discovery objects on the platform cluster and returns true if a requeue is needed.
+	Delete(ctx context.Context) (bool, error)
 	// Credentials returns a reference to the first docker-config secret found on the base components effective OCM config, or nil if none exists.
 	Credentials(ctx context.Context) (*corev1.LocalObjectReference, error)
 	// Resolve fetches the Discovery for discId, finds the component matching version and componentMatchFunc if not nil, then returns the first resource matching resourceMatchFunc.
@@ -137,6 +139,18 @@ func (r *resolver) Apply(ctx context.Context) (bool, error) {
 	rr, err := mgr.Apply(ctx)
 	if err != nil {
 		return false, fmt.Errorf("failed to apply discovery objects: %w", err)
+	}
+	return rr.Requeue, nil
+}
+
+func (r *resolver) Delete(ctx context.Context) (bool, error) {
+	platformCluster := objectmanager.NewCluster(r.cluster, r.namespace, objectmanager.PlatformCluster)
+	manageDiscoveries(r.discoveryconfigs, r.namespace, platformCluster, r.serviceProvider, r.baseComponent.Name)
+	mgr := objectmanager.NewManager(r.serviceProvider)
+	mgr.AddCluster(platformCluster)
+	rr, err := mgr.Delete(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to delete discovery objects: %w", err)
 	}
 	return rr.Requeue, nil
 }
