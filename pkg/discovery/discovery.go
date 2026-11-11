@@ -50,7 +50,7 @@ var (
 type Resolver interface {
 	// Apply creates or updates the Discovery objects on the platform cluster and returns true if a requeue is needed.
 	Apply(ctx context.Context) (bool, error)
-	// Credentials returns a reference to the first docker-config secret found in the releasechannels effective OCM config, or nil if none exists.
+	// Credentials returns a reference to the first docker-config secret found on the base components effective OCM config, or nil if none exists.
 	Credentials(ctx context.Context) (*corev1.LocalObjectReference, error)
 	// Resolve fetches the Discovery for discId, finds the component matching version and componentMatchFunc if not nil, then returns the first resource matching resourceMatchFunc.
 	Resolve(ctx context.Context, discId, version string, componentMatchFunc ComponentMatchFunc, resourceMatchFunc ResourceMatchFunc) (Resource, error)
@@ -62,7 +62,7 @@ type resolver struct {
 	cluster          *clusters.Cluster
 	serviceProvider  string
 	namespace        string
-	releasechannel   ocmv1alpha1.Component
+	baseComponent    ocmv1alpha1.Component
 	discoveryconfigs []DiscoveryConfig
 	basePath         string
 }
@@ -71,7 +71,7 @@ type resolver struct {
 type Config struct {
 	ServiceProvider  string
 	Namespace        string
-	Releasechannel   string
+	BaseComponent    string
 	DiscoveryConfigs []DiscoveryConfig
 }
 
@@ -97,13 +97,13 @@ type Resource struct {
 	AccessURL string
 }
 
-// NewResolver creates a Resolver by fetching the named releasechannel Component and computing its OCI base path.
+// NewResolver creates a Resolver by fetching the base component and computing its OCI base path.
 func NewResolver(ctx context.Context, cfg Config, c *clusters.Cluster) (Resolver, error) {
-	releasechannel, err := fetchReleasechannel(ctx, c.Cluster().GetClient(), cfg.Releasechannel, cfg.Namespace)
+	baseComponent, err := fetchBaseComponent(ctx, c.Cluster().GetClient(), cfg.BaseComponent, cfg.Namespace)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch releasechannel component: %w", err)
+		return nil, fmt.Errorf("failed to fetch base component: %w", err)
 	}
-	basePath, err := computeBasePath(releasechannel)
+	basePath, err := computeBasePath(baseComponent)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute base path: %w", err)
 	}
@@ -111,17 +111,17 @@ func NewResolver(ctx context.Context, cfg Config, c *clusters.Cluster) (Resolver
 		cluster:          c,
 		serviceProvider:  cfg.ServiceProvider,
 		namespace:        cfg.Namespace,
-		releasechannel:   releasechannel,
+		baseComponent:    baseComponent,
 		discoveryconfigs: cfg.DiscoveryConfigs,
 		basePath:         basePath,
 	}, nil
 }
 
-func fetchReleasechannel(ctx context.Context, reader client.Reader, name string, namespace string) (ocmv1alpha1.Component, error) {
+func fetchBaseComponent(ctx context.Context, reader client.Reader, name string, namespace string) (ocmv1alpha1.Component, error) {
 	component := ocmv1alpha1.Component{}
 	err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &component)
 	if apierrors.IsNotFound(err) {
-		return ocmv1alpha1.Component{}, fmt.Errorf("releasechannel component %s/%s was not found", namespace, name)
+		return ocmv1alpha1.Component{}, fmt.Errorf("base component %s/%s was not found", namespace, name)
 	}
 	if err != nil {
 		return ocmv1alpha1.Component{}, err
@@ -131,7 +131,7 @@ func fetchReleasechannel(ctx context.Context, reader client.Reader, name string,
 
 func (r *resolver) Apply(ctx context.Context) (bool, error) {
 	platformCluster := objectmanager.NewCluster(r.cluster, r.namespace, objectmanager.PlatformCluster)
-	manageDiscoveries(r.discoveryconfigs, r.namespace, platformCluster, r.serviceProvider, r.releasechannel.Name)
+	manageDiscoveries(r.discoveryconfigs, r.namespace, platformCluster, r.serviceProvider, r.baseComponent.Name)
 	mgr := objectmanager.NewManager(r.serviceProvider)
 	mgr.AddCluster(platformCluster)
 	rr, err := mgr.Apply(ctx)
@@ -141,7 +141,7 @@ func (r *resolver) Apply(ctx context.Context) (bool, error) {
 	return rr.Requeue, nil
 }
 
-func manageDiscoveries(discoveryConfigs []DiscoveryConfig, namespace string, cluster objectmanager.Cluster, serviceProvider string, releasechannel string) {
+func manageDiscoveries(discoveryConfigs []DiscoveryConfig, namespace string, cluster objectmanager.Cluster, serviceProvider string, baseComponent string) {
 	for _, discConfig := range discoveryConfigs {
 		discovery := objectmanager.NewObject(
 			&ocmv1alpha1.Discovery{
@@ -150,7 +150,7 @@ func manageDiscoveries(discoveryConfigs []DiscoveryConfig, namespace string, clu
 					Namespace: namespace,
 				},
 				Spec: ocmv1alpha1.DiscoverySpec{
-					ComponentRef: corev1.LocalObjectReference{Name: releasechannel},
+					ComponentRef: corev1.LocalObjectReference{Name: baseComponent},
 				},
 			},
 			objectmanager.ObjectConfig{
@@ -160,7 +160,7 @@ func manageDiscoveries(discoveryConfigs []DiscoveryConfig, namespace string, clu
 						return fmt.Errorf("expected *ocmv1alpha1.Discovery, got %T", o)
 					}
 					discovery.Spec = ocmv1alpha1.DiscoverySpec{
-						ComponentRef:      corev1.LocalObjectReference{Name: releasechannel},
+						ComponentRef:      corev1.LocalObjectReference{Name: baseComponent},
 						ComponentSelector: discConfig.ComponentSelector,
 						ResourceSelector:  discConfig.ResourceSelector,
 					}
@@ -196,7 +196,7 @@ func discoveryStatus(object client.Object) objectmanager.ManagedObjectStatus {
 
 func (r *resolver) Credentials(ctx context.Context) (*corev1.LocalObjectReference, error) {
 	reader := r.cluster.Cluster().GetClient()
-	configs := r.releasechannel.GetEffectiveOCMConfig()
+	configs := r.baseComponent.GetEffectiveOCMConfig()
 	var fetchErrs []error
 	for _, config := range configs {
 		if config.Kind != "Secret" {
@@ -322,8 +322,8 @@ func (r *resolver) Resolve(ctx context.Context, discId, version string, componen
 	return resource, nil
 }
 
-func computeBasePath(releasechannel ocmv1alpha1.Component) (string, error) {
-	ociRepo, err := ociRepoFromComponent(&releasechannel)
+func computeBasePath(baseComponent ocmv1alpha1.Component) (string, error) {
+	ociRepo, err := ociRepoFromComponent(&baseComponent)
 	if err != nil {
 		return "", err
 	}
