@@ -46,6 +46,11 @@ var (
 	}()
 )
 
+var (
+	ErrComponentNotFound = errors.New("component not found")
+	ErrResourceNotFound  = errors.New("resource not found")
+)
+
 // Resolver manages Discovery objects and resolves OCM resources from them.
 type Resolver interface {
 	// Apply creates or updates the Discovery objects on the platform cluster and returns true if a requeue is needed.
@@ -327,7 +332,7 @@ func (r *resolver) Resolve(ctx context.Context, discId, version string, componen
 	}
 	component, ok := findComponent(components, componentMatchFunc, version)
 	if !ok {
-		return Resource{}, fmt.Errorf("failed to find component for version %q", version)
+		return Resource{}, fmt.Errorf("failed to find component for version %q: %w", version, ErrComponentNotFound)
 	}
 	resource, err := findResource(component, r.basePath, resourceMatchFunc)
 	if err != nil {
@@ -421,7 +426,7 @@ func findResource(component Component, basePath string, resourceMatchFunc Resour
 			}, nil
 		}
 	}
-	return Resource{}, fmt.Errorf("no matching resource was found")
+	return Resource{}, fmt.Errorf("no matching resource was found: %w", ErrResourceNotFound)
 }
 
 func decodeAccess(resource v2.Resource, basePath string, componentName string) (string, error) {
