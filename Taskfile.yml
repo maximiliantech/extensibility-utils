@@ -7,5 +7,6 @@ includes:
     vars:
       NESTED_MODULES: ''
       CODE_DIRS: '{{.ROOT_DIR}}/pkg/...'
+      API_DIRS: '{{.ROOT_DIR}}/pkg/discovery/api/...'
       GENERATE_DOCS_INDEX: "false"
       MANIFEST_OUT: ""
