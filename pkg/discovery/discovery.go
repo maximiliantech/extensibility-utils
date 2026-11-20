@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path"
 	"slices"
 	"strings"
 
@@ -27,7 +26,6 @@ import (
 	"ocm.software/open-component-model/bindings/go/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/openmcp-project/extensibility-utils/pkg/discovery/api/v1alpha1"
 	apiv1alpha1 "github.com/openmcp-project/extensibility-utils/pkg/discovery/api/v1alpha1"
 	"github.com/openmcp-project/extensibility-utils/pkg/objectmanager"
 )
@@ -53,6 +51,14 @@ var (
 	ErrResourceNotFound  = errors.New("resource not found")
 )
 
+// ResourceIdentifier identifies the kind of resource which should be resolved from a component.
+type ResourceIdentifier = string
+
+const (
+	TypeImage ResourceIdentifier = "image"
+	TypeChart ResourceIdentifier = "helmChart"
+)
+
 // Resolver manages Discovery objects and resolves OCM resources from them.
 type Resolver interface {
 	// Apply creates or updates the Discovery objects on the platform cluster and returns true if a requeue is needed.
@@ -61,10 +67,35 @@ type Resolver interface {
 	Delete(ctx context.Context) (bool, error)
 	// Credentials returns a reference to the first docker-config secret found on the base components effective OCM config, or nil if none exists.
 	Credentials(ctx context.Context) (*corev1.LocalObjectReference, error)
-	// Resolve fetches the Discovery for discId, finds the component matching version and componentMatchFunc if not nil, then returns the first resource matching resourceMatchFunc.
-	Resolve(ctx context.Context, discID, requestedComponent, requestedResource, version string) (Resource, error)
-	// ListComponentVersions returns the available component versions for discId, optionally filtered by matchFunc, sorted oldest first.
-	ListComponentVersions(ctx context.Context, discId string, requestedComponent string) ([]string, error)
+	// Resolve fetches the Discovery for discID, finds the component matching version (optionally restricted via WithComponentLabel), then returns the first resource matching resourceIdentifier.
+	Resolve(ctx context.Context, discID string, resourceIdentifier ResourceIdentifier, version string, opts ...ResolveOption) (string, error)
+	// ListComponentVersions returns the available component versions for discID (optionally restricted via WithComponentLabel) sorted oldest first.
+	ListComponentVersions(ctx context.Context, discID string, opts ...ResolveOption) ([]string, error)
+}
+
+// ResolveOptions holds the resolved optional parameters for Resolver operations.
+type ResolveOptions struct {
+	// ComponentLabel, when non-empty, restricts the operation to components whose label value matches this identifier.
+	ComponentLabel string
+}
+
+// ResolveOption configures Options for a Resolver operation.
+type ResolveOption func(*ResolveOptions)
+
+// ApplyResolveOptions resolves opts into an Options value.
+func ApplyResolveOptions(opts ...ResolveOption) ResolveOptions {
+	var o ResolveOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
+// WithComponentLabel restricts the resolution to only the components matching the label. When omitted all components are considered.
+func WithComponentLabel(componentLabel string) ResolveOption {
+	return func(o *ResolveOptions) {
+		o.ComponentLabel = componentLabel
+	}
 }
 
 type resolver struct {
@@ -72,10 +103,9 @@ type resolver struct {
 	serviceProvider       string
 	namespace             string
 	baseComponent         ocmv1alpha1.Component
-	discoveryConfigs      map[string]apiv1alpha1.ComponentConfig
+	discoveryConfigs      map[string]apiv1alpha1.DiscoveryConfig
 	basePath              string
 	defaultComponentLabel string
-	defaultResourceLabel  string
 }
 
 // Config holds the configuration for creating a new Resolver.
@@ -83,13 +113,8 @@ type Config struct {
 	ServiceProvider  string
 	Namespace        string
 	BaseComponent    string
-	DiscoveryConfigs map[string]apiv1alpha1.ComponentConfig
+	DiscoveryConfigs map[string]apiv1alpha1.DiscoveryConfig
 }
-
-// // ServiceDiscoveryConfig defines a single Discovery object to be managed, with optional selectors to filter components and resources.
-// type ServiceDiscoveryConfig struct {
-// 	ID map[string]apiv1alpha1.DiscoveryConfig
-// }
 
 // Component is a parsed OCM component descriptor entry with its name, version, resources, and labels.
 type Component struct {
@@ -110,8 +135,11 @@ func defaultComponentLabel(providerName string) string {
 	return fmt.Sprintf("%s.services.open-control-plane.io/%s", providerName, "component")
 }
 
-func defaultResourceLabel(providerName string) string {
-	return fmt.Sprintf("%s.services.open-control-plane.io/%s", providerName, "resource")
+// DefaultComponentLabelKey returns the label key used to match components via WithComponent
+// when a DiscoveryConfig does not override it through ComponentMatchLabelKey.
+// It is exported so test doubles can reproduce the resolver's default component matching.
+func DefaultComponentLabelKey(providerName string) string {
+	return defaultComponentLabel(providerName)
 }
 
 func defaultComponentSelector(providerName string, componentType string) *ocmv1alpha1.Selector {
@@ -141,7 +169,6 @@ func NewResolver(ctx context.Context, cfg Config, c *clusters.Cluster) (Resolver
 		discoveryConfigs:      cfg.DiscoveryConfigs,
 		basePath:              basePath,
 		defaultComponentLabel: defaultComponentLabel(cfg.ServiceProvider),
-		defaultResourceLabel:  defaultResourceLabel(cfg.ServiceProvider),
 	}, nil
 }
 
@@ -157,6 +184,7 @@ func fetchBaseComponent(ctx context.Context, reader client.Reader, name string, 
 	return component, nil
 }
 
+// Apply builds the Discovery objects and creates/updates them on the platform cluster. It returns true when a requeue is needed.
 func (r *resolver) Apply(ctx context.Context) (bool, error) {
 	platformCluster := objectmanager.NewCluster(r.cluster, r.namespace, objectmanager.PlatformCluster)
 	manageDiscoveries(r.discoveryConfigs, r.namespace, platformCluster, r.serviceProvider, r.baseComponent.Name)
@@ -169,6 +197,7 @@ func (r *resolver) Apply(ctx context.Context) (bool, error) {
 	return rr.Requeue, nil
 }
 
+// Delete builds the Discovery objects and deletes them on the platform cluster. It returns true when a requeue is needed.
 func (r *resolver) Delete(ctx context.Context) (bool, error) {
 	platformCluster := objectmanager.NewCluster(r.cluster, r.namespace, objectmanager.PlatformCluster)
 	manageDiscoveries(r.discoveryConfigs, r.namespace, platformCluster, r.serviceProvider, r.baseComponent.Name)
@@ -181,12 +210,14 @@ func (r *resolver) Delete(ctx context.Context) (bool, error) {
 	return rr.Requeue, nil
 }
 
-func manageDiscoveries(discoveryConfigs map[string]apiv1alpha1.ComponentConfig, namespace string, cluster objectmanager.Cluster, serviceProvider string, baseComponent string) {
+func manageDiscoveries(discoveryConfigs map[string]apiv1alpha1.DiscoveryConfig, namespace string, cluster objectmanager.Cluster, serviceProvider string, baseComponent string) {
 	for discId, discConfig := range discoveryConfigs {
 		dcs := defaultComponentSelector(serviceProvider, discId)
 		var rs *ocmv1alpha1.Selector
 		if discConfig.SelectorConfig != nil {
-			dcs = discConfig.SelectorConfig.ComponentSelector
+			if discConfig.SelectorConfig.ComponentSelector != nil {
+				dcs = discConfig.SelectorConfig.ComponentSelector
+			}
 			rs = discConfig.SelectorConfig.ResourceSelector
 		}
 		discovery := objectmanager.NewObject(
@@ -240,6 +271,7 @@ func discoveryStatus(object client.Object) objectmanager.ManagedObjectStatus {
 	return objectmanager.ManagedObjectStatus{Phase: objectmanager.StatusPhaseReady, Message: "Resource exists."}
 }
 
+// Credentials fetches the effective OCM config on the base component and returns the first secret of type SecretTypeDockerConfigJson
 func (r *resolver) Credentials(ctx context.Context) (*corev1.LocalObjectReference, error) {
 	reader := r.cluster.Cluster().GetClient()
 	configs := r.baseComponent.GetEffectiveOCMConfig()
@@ -269,16 +301,55 @@ func (r *resolver) Credentials(ctx context.Context) (*corev1.LocalObjectReferenc
 	return nil, nil
 }
 
-// ComponentMatchFunc returns true if the given Component should be selected.
-type ComponentMatchFunc func(Component) bool
+// ListComponentVersions returns the versions of the components available in a Discovery sorted oldest first.
+// By default every component in the discovery is considered. Pass WithComponent to restrict the result to a single component.
+func (r *resolver) ListComponentVersions(ctx context.Context, discID string, opts ...ResolveOption) ([]string, error) {
+	discConfig, ok := r.discoveryConfigs[discID]
+	if !ok {
+		return nil, fmt.Errorf("failed to find discovery id %q", discID)
+	}
+	discovery, err := r.fetchDiscovery(ctx, discID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch discovery %q: %w", discID, err)
+	}
+	components, err := parseDiscovery(discovery)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse discovery %q: %w", discID, err)
+	}
+	cmf, err := r.componentMatchFunc(discConfig, ApplyResolveOptions(opts...))
+	if err != nil {
+		return nil, err
+	}
 
-func ComponentByName(name string) ComponentMatchFunc {
-	return func(c Component) bool { return c.Name == name }
+	var availableVersions []string
+	for _, component := range components {
+		if cmf == nil || cmf(component) {
+			availableVersions = append(availableVersions, component.Version)
+		}
+	}
+	slices.SortFunc(availableVersions, CompareVersions)
+	return availableVersions, nil
 }
-func ComponentByShortName(name string) ComponentMatchFunc {
-	return func(c Component) bool { return path.Base(c.Name) == name }
+
+func (r *resolver) componentMatchFunc(discConfig apiv1alpha1.DiscoveryConfig, o ResolveOptions) (componentMatchFunc, error) {
+	if o.ComponentLabel == "" {
+		return nil, nil
+	}
+	raw, err := json.Marshal(o.ComponentLabel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal component: %w", err)
+	}
+	key := defaultComponentLabel(r.serviceProvider)
+	if discConfig.ComponentMatchLabelKey != "" {
+		key = discConfig.ComponentMatchLabelKey
+	}
+	return componentByLabel(key, json.RawMessage(raw)), nil
 }
-func ComponentByLabel(key string, value json.RawMessage) ComponentMatchFunc {
+
+// componentMatchFunc returns true if the given Component should be selected.
+type componentMatchFunc func(Component) bool
+
+func componentByLabel(key string, value json.RawMessage) componentMatchFunc {
 	return func(c Component) bool {
 		for _, l := range c.Labels {
 			if l.Name == key && bytes.Equal(l.Value, value) {
@@ -287,63 +358,6 @@ func ComponentByLabel(key string, value json.RawMessage) ComponentMatchFunc {
 		}
 		return false
 	}
-}
-
-func (r *resolver) ListComponentVersions(ctx context.Context, discID string, component string) ([]string, error) {
-	discConfig, ok := r.discoveryConfigs[discID]
-	if !ok {
-		return nil, fmt.Errorf("failed to find discovery id %s", discID)
-	}
-	discovery, err := r.fetchDiscovery(ctx, discID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch discovery %s: %w", discID, err)
-	}
-	components, err := parseDiscovery(discovery)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse discovery %s: %w", discID, err)
-	}
-	raw, err := json.Marshal(component)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal component: %w", err)
-	}
-	cmf := ComponentByLabel(defaultComponentLabel(r.serviceProvider), json.RawMessage(raw))
-	if discConfig.ComponentMatchLabelKey != "" {
-		cmf = ComponentByLabel(discConfig.ComponentMatchLabelKey, json.RawMessage(raw))
-	}
-
-	var availableVersions []string
-	for _, component := range components {
-		if cmf(component) {
-			availableVersions = append(availableVersions, component.Version)
-		}
-	}
-	slices.SortFunc(availableVersions, CompareVersions)
-	return availableVersions, nil
-}
-
-func determineResourceMatchFunc(cfg *apiv1alpha1.ResourceConfig, requestedResource string, providerName string) (ResourceMatchFunc, error) {
-	var rmf ResourceMatchFunc
-	var raw []byte
-	var err error
-
-	switch {
-	case cfg == nil:
-		raw, err = json.Marshal(requestedResource)
-		rmf = ResourceByLabel(defaultResourceLabel(providerName), json.RawMessage(raw))
-	case cfg.Name != "":
-		rmf = ResourceByName(requestedResource)
-	case cfg.ResourceType != "":
-		rmf = ResourceByType(requestedResource)
-	case cfg.Label != nil:
-		if cfg.Label.Key == "" || cfg.Label.Value == "" {
-			err = fmt.Errorf("LabelConfig key and value must be set")
-		}
-		raw, err = json.Marshal(cfg.Label.Value)
-		rmf = ResourceByLabel(cfg.Label.Key, json.RawMessage(raw))
-	default:
-		err = fmt.Errorf("resource match func cloud not be dertermined")
-	}
-	return rmf, err
 }
 
 // CompareVersions orders two component versions oldest first.
@@ -363,19 +377,81 @@ func CompareVersions(a, b string) int {
 	}
 }
 
-// ResourceMatchFunc returns true if the given OCM resource should be selected.
-type ResourceMatchFunc func(v2.Resource) bool
+// Resolve looks up a single resource from the components in the Discovery.
+// It selects the component by versions, ignoring any leading "v".
+// Pass WithComponent if the version is not enough to uniquely identify a component in the Discovery.
+// By default the resourceIdentifier is matched against the type of the resource.
+// Use the Discoveries ResourceConfig entry to match another attribute.
+// It returns ErrComponentNotFound if no component matches and ErrResourceNotFound if the component has no matching resource.
+func (r *resolver) Resolve(ctx context.Context, discID string, resourceIdentifier ResourceIdentifier, version string, opts ...ResolveOption) (string, error) {
+	discConfig, ok := r.discoveryConfigs[discID]
+	if !ok {
+		return "", fmt.Errorf("failed to find discovery id %q", discID)
+	}
+	discovery, err := r.fetchDiscovery(ctx, discID)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch discovery %q: %w", discID, err)
+	}
+	components, err := parseDiscovery(discovery)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse discovery %q: %w", discID, err)
+	}
+	cmf, err := r.componentMatchFunc(discConfig, ApplyResolveOptions(opts...))
+	if err != nil {
+		return "", err
+	}
+	discoveredComponent, ok := findComponent(components, cmf, version)
+	if !ok {
+		return "", fmt.Errorf("failed to find component for version %q: %w", version, ErrComponentNotFound)
+	}
+	var rcPtr *apiv1alpha1.ResourceConfig
+	rc, ok := discConfig.ResourceConfig[resourceIdentifier]
+	if ok {
+		rcPtr = &rc
+	}
+	resourceMatchFunc, err := determineResourceMatchFunc(rcPtr, resourceIdentifier)
+	if err != nil {
+		return "", fmt.Errorf("failed to determine resource match func: %w", err)
+	}
+	resource, err := findResource(discoveredComponent, r.basePath, resourceMatchFunc)
+	if err != nil {
+		return "", fmt.Errorf("failed to find resource in discovery %q: %w", discID, err)
+	}
+	return resource.AccessURL, nil
+}
 
-func ResourceByName(name string) ResourceMatchFunc {
+func determineResourceMatchFunc(cfg *apiv1alpha1.ResourceConfig, resourceIdentifier string) (resourceMatchFunc, error) {
+	switch {
+	case cfg == nil:
+		return resourceByType(resourceIdentifier), nil
+	case cfg.Name != "":
+		return resourceByName(cfg.Name), nil
+	case cfg.ResourceType != "":
+		return resourceByType(cfg.ResourceType), nil
+	case cfg.Label != nil:
+		if cfg.Label.Key == "" || cfg.Label.Value == "" {
+			return nil, fmt.Errorf("LabelConfig key and value must be set")
+		}
+		raw, err := json.Marshal(cfg.Label.Value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal label value %q: %w", cfg.Label.Value, err)
+		}
+		return resourceByLabel(cfg.Label.Key, json.RawMessage(raw)), nil
+	default:
+		return nil, fmt.Errorf("no resource match func could be determined")
+	}
+}
+
+// resourceMatchFunc returns true if the given OCM resource should be selected.
+type resourceMatchFunc func(v2.Resource) bool
+
+func resourceByName(name string) resourceMatchFunc {
 	return func(r v2.Resource) bool { return r.Name == name }
 }
-func ResourceByShortName(name string) ResourceMatchFunc {
-	return func(r v2.Resource) bool { return path.Base(r.Name) == name }
-}
-func ResourceByType(resourceType string) ResourceMatchFunc {
+func resourceByType(resourceType string) resourceMatchFunc {
 	return func(r v2.Resource) bool { return r.Type == resourceType }
 }
-func ResourceByLabel(key string, value json.RawMessage) ResourceMatchFunc {
+func resourceByLabel(key string, value json.RawMessage) resourceMatchFunc {
 	return func(r v2.Resource) bool {
 		for _, l := range r.Labels {
 			if l.Name == key && bytes.Equal(l.Value, value) {
@@ -384,46 +460,6 @@ func ResourceByLabel(key string, value json.RawMessage) ResourceMatchFunc {
 		}
 		return false
 	}
-}
-
-func (r *resolver) Resolve(ctx context.Context, discID, requestedComponent, requestedResource, version string) (Resource, error) {
-	discConfig, ok := r.discoveryConfigs[discID]
-	if !ok {
-		return Resource{}, fmt.Errorf("failed to find discovery id %s", discID)
-	}
-	discovery, err := r.fetchDiscovery(ctx, discID)
-	if err != nil {
-		return Resource{}, fmt.Errorf("failed to fetch discovery %q: %w", discID, err)
-	}
-	components, err := parseDiscovery(discovery)
-	if err != nil {
-		return Resource{}, fmt.Errorf("failed to parse discovery %q: %w", discID, err)
-	}
-	raw, err := json.Marshal(requestedComponent)
-	if err != nil {
-		return Resource{}, fmt.Errorf("failed to marshal component: %w", err)
-	}
-	cmf := ComponentByLabel(defaultComponentLabel(r.serviceProvider), json.RawMessage(raw))
-	if discConfig.ComponentMatchLabelKey != "" {
-		cmf = ComponentByLabel(discConfig.ComponentMatchLabelKey, json.RawMessage(raw))
-	}
-	discoveredComponent, ok := findComponent(components, cmf, version)
-	if !ok {
-		return Resource{}, fmt.Errorf("failed to find component for version %q: %w", version, ErrComponentNotFound)
-	}
-	var rcPtr *v1alpha1.ResourceConfig
-	if rc, ok := discConfig.ResourceConfig[requestedResource]; ok {
-		rcPtr = &rc
-	}
-	resourceMatchFunc, err := determineResourceMatchFunc(rcPtr, requestedResource, r.serviceProvider)
-	if err != nil {
-		return Resource{}, fmt.Errorf("failed to determine resource match func: %w", err)
-	}
-	resource, err := findResource(discoveredComponent, r.basePath, resourceMatchFunc)
-	if err != nil {
-		return Resource{}, fmt.Errorf("failed to find resource in discovery %q: %w", discID, err)
-	}
-	return resource, nil
 }
 
 func computeBasePath(baseComponent ocmv1alpha1.Component) (string, error) {
@@ -468,7 +504,7 @@ func parseDiscovery(discovery ocmv1alpha1.Discovery) ([]Component, error) {
 		var desc v2.Descriptor
 		err := json.Unmarshal(raw.Raw, &desc)
 		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal components of discovery %s: %w", discovery.Name, err)
+			return nil, fmt.Errorf("failed to unmarshal components of discovery %q: %w", discovery.Name, err)
 		}
 		component := Component{
 			Name:      desc.Component.Name,
@@ -481,7 +517,7 @@ func parseDiscovery(discovery ocmv1alpha1.Discovery) ([]Component, error) {
 	return components, nil
 }
 
-func findComponent(components []Component, componentMatchFunc ComponentMatchFunc, version string) (Component, bool) {
+func findComponent(components []Component, componentMatchFunc componentMatchFunc, version string) (Component, bool) {
 	for _, component := range components {
 		if (componentMatchFunc == nil || componentMatchFunc(component)) && normalizeVersion(component.Version) == normalizeVersion(version) {
 			return component, true
@@ -494,7 +530,7 @@ func normalizeVersion(version string) string {
 	return strings.TrimPrefix(version, "v")
 }
 
-func findResource(component Component, basePath string, resourceMatchFunc ResourceMatchFunc) (Resource, error) {
+func findResource(component Component, basePath string, resourceMatchFunc resourceMatchFunc) (Resource, error) {
 	if resourceMatchFunc == nil {
 		return Resource{}, fmt.Errorf("matchFunc must not be nil")
 	}

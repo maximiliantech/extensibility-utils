@@ -11,6 +11,8 @@ import (
 	ocmpath "ocm.software/open-component-model/bindings/go/oci/spec/repository/path"
 	ocirepov1 "ocm.software/open-component-model/bindings/go/oci/spec/repository/v1/oci"
 	"ocm.software/open-component-model/bindings/go/runtime"
+
+	apiv1alpha1 "github.com/openmcp-project/extensibility-utils/pkg/discovery/api/v1alpha1"
 )
 
 // mustRaw marshals an OCIImage access JSON into a *runtime.Raw for use in test resources.
@@ -173,15 +175,23 @@ func TestParseDiscovery(t *testing.T) {
 }
 
 func TestFindComponent(t *testing.T) {
+	label := func(name string) []v2.Label {
+		v, _ := json.Marshal(name)
+		return []v2.Label{{Name: "component", Value: v}}
+	}
+	matchLabel := func(name string) componentMatchFunc {
+		v, _ := json.Marshal(name)
+		return componentByLabel("component", v)
+	}
 	components := []Component{
-		{Name: "ghcr.io/org/comp-a", Version: "v1.0.0"},
-		{Name: "ghcr.io/org/comp-a", Version: "v2.0.0"},
-		{Name: "ghcr.io/org/comp-b", Version: "v1.0.0"},
+		{Name: "ghcr.io/org/comp-a", Version: "v1.0.0", Labels: label("comp-a")},
+		{Name: "ghcr.io/org/comp-a", Version: "v2.0.0", Labels: label("comp-a")},
+		{Name: "ghcr.io/org/comp-b", Version: "v1.0.0", Labels: label("comp-b")},
 	}
 
 	tests := []struct {
 		name      string
-		matchFunc ComponentMatchFunc
+		matchFunc componentMatchFunc
 		version   string
 		wantName  string
 		wantFound bool
@@ -194,28 +204,28 @@ func TestFindComponent(t *testing.T) {
 			wantFound: true,
 		},
 		{
-			name:      "match by name and version",
-			matchFunc: ComponentByName("ghcr.io/org/comp-b"),
+			name:      "match by label and version",
+			matchFunc: matchLabel("comp-b"),
 			version:   "v1.0.0",
 			wantName:  "ghcr.io/org/comp-b",
 			wantFound: true,
 		},
 		{
-			name:      "match by short name",
-			matchFunc: ComponentByShortName("comp-a"),
+			name:      "label matches multiple, version selects one",
+			matchFunc: matchLabel("comp-a"),
 			version:   "v2.0.0",
 			wantName:  "ghcr.io/org/comp-a",
 			wantFound: true,
 		},
 		{
 			name:      "version mismatch returns not found",
-			matchFunc: ComponentByName("ghcr.io/org/comp-a"),
+			matchFunc: matchLabel("comp-a"),
 			version:   "v9.0.0",
 			wantFound: false,
 		},
 		{
 			name:      "no matching component",
-			matchFunc: ComponentByName("ghcr.io/org/comp-missing"),
+			matchFunc: matchLabel("comp-missing"),
 			version:   "v1.0.0",
 			wantFound: false,
 		},
@@ -247,7 +257,7 @@ func TestFindResource(t *testing.T) {
 
 	tests := []struct {
 		name          string
-		matchFunc     ResourceMatchFunc
+		matchFunc     resourceMatchFunc
 		wantAccessURL string
 		wantErr       bool
 	}{
@@ -257,12 +267,12 @@ func TestFindResource(t *testing.T) {
 		},
 		{
 			name:          "matching resource is returned",
-			matchFunc:     ResourceByName("test-image"),
+			matchFunc:     resourceByName("test-image"),
 			wantAccessURL: "ghcr.io/test-image:v1.0.0",
 		},
 		{
 			name:      "no matching resource returns error",
-			matchFunc: ResourceByName("missing"),
+			matchFunc: resourceByName("missing"),
 			wantErr:   true,
 		},
 	}
@@ -302,22 +312,14 @@ func TestMatchFunctions(t *testing.T) {
 		got  bool
 		want bool
 	}{
-		{"ComponentByName exact", ComponentByName("ghcr.io/org/comp-a")(component), true},
-		{"ComponentByName wrong", ComponentByName("ghcr.io/org/other")(component), false},
-		{"ComponentByShortName exact", ComponentByShortName("comp-a")(component), true},
-		{"ComponentByShortName partial path", ComponentByShortName("org/comp-a")(component), false},
-		{"ComponentByShortName unrelated", ComponentByShortName("missing")(component), false},
-		{"ComponentByLabel matching key and value", ComponentByLabel("env", production)(component), true},
-		{"ComponentByLabel matching key wrong value", ComponentByLabel("env", staging)(component), false},
-		{"ComponentByLabel missing key", ComponentByLabel("missing", production)(component), false},
-		{"ResourceByType matching", ResourceByType("helmChart")(resource), true},
-		{"ResourceByType wrong", ResourceByType("image")(resource), false},
-		{"ResourceByLabel matching key and value", ResourceByLabel("env", production)(resource), true},
-		{"ResourceByLabel matching key wrong value", ResourceByLabel("env", staging)(resource), false},
-		{"ResourceByLabel missing key", ResourceByLabel("missing", production)(resource), false},
-		{"ResourceByShortName exact", ResourceByShortName("test-image")(resource), true},
-		{"ResourceByShortName partial path", ResourceByShortName("org/repo/test-image")(resource), false},
-		{"ResourceByShortName unrelated", ResourceByShortName("missing")(resource), false},
+		{"componentByLabel matching key and value", componentByLabel("env", production)(component), true},
+		{"componentByLabel matching key wrong value", componentByLabel("env", staging)(component), false},
+		{"componentByLabel missing key", componentByLabel("missing", production)(component), false},
+		{"resourceByType matching", resourceByType("helmChart")(resource), true},
+		{"resourceByType wrong", resourceByType("image")(resource), false},
+		{"resourceByLabel matching key and value", resourceByLabel("env", production)(resource), true},
+		{"resourceByLabel matching key wrong value", resourceByLabel("env", staging)(resource), false},
+		{"resourceByLabel missing key", resourceByLabel("missing", production)(resource), false},
 	}
 
 	for _, tc := range tests {
@@ -416,6 +418,262 @@ func TestCompareVersions(t *testing.T) {
 			slices.SortFunc(sorted, CompareVersions)
 			if !slices.Equal(sorted, tc.want) {
 				t.Errorf("sorted = %v, want %v", sorted, tc.want)
+			}
+		})
+	}
+}
+
+func TestDetermineResourceMatchFunc(t *testing.T) {
+	labelValue := func(s string) json.RawMessage {
+		v, _ := json.Marshal(s)
+		return v
+	}
+	helmResource := v2.Resource{
+		ElementMeta: v2.ElementMeta{ObjectMeta: v2.ObjectMeta{
+			Name:   "crossplane-chart",
+			Labels: []v2.Label{{Name: "env", Value: labelValue("production")}},
+		}},
+		Type: "helmChart",
+	}
+	imageResource := v2.Resource{
+		ElementMeta: v2.ElementMeta{ObjectMeta: v2.ObjectMeta{Name: "crossplane-image"}},
+		Type:        "image",
+	}
+
+	tests := []struct {
+		name      string
+		cfg       *apiv1alpha1.ResourceConfig
+		requested string
+		resource  v2.Resource
+		wantMatch bool
+		wantErr   bool
+	}{
+		{
+			name:      "nil cfg matches by requested type",
+			cfg:       nil,
+			requested: "helmChart",
+			resource:  helmResource,
+			wantMatch: true,
+		},
+		{
+			name:      "nil cfg rejects other type",
+			cfg:       nil,
+			requested: "helmChart",
+			resource:  imageResource,
+			wantMatch: false,
+		},
+		{
+			name:      "name cfg matches by name ignoring requested type",
+			cfg:       &apiv1alpha1.ResourceConfig{Name: "crossplane-chart"},
+			requested: "image",
+			resource:  helmResource,
+			wantMatch: true,
+		},
+		{
+			name:      "name cfg rejects other name",
+			cfg:       &apiv1alpha1.ResourceConfig{Name: "crossplane-chart"},
+			requested: "image",
+			resource:  imageResource,
+			wantMatch: false,
+		},
+		{
+			name:      "resourceType cfg matches by type ignoring requested",
+			cfg:       &apiv1alpha1.ResourceConfig{ResourceType: "helmChart"},
+			requested: "chart",
+			resource:  helmResource,
+			wantMatch: true,
+		},
+		{
+			name:      "resourceType cfg rejects other type",
+			cfg:       &apiv1alpha1.ResourceConfig{ResourceType: "helmChart"},
+			requested: "chart",
+			resource:  imageResource,
+			wantMatch: false,
+		},
+		{
+			name:      "label cfg matches by label",
+			cfg:       &apiv1alpha1.ResourceConfig{Label: &apiv1alpha1.LabelConfig{Key: "env", Value: "production"}},
+			resource:  helmResource,
+			wantMatch: true,
+		},
+		{
+			name:      "label cfg rejects resource without label",
+			cfg:       &apiv1alpha1.ResourceConfig{Label: &apiv1alpha1.LabelConfig{Key: "env", Value: "production"}},
+			resource:  imageResource,
+			wantMatch: false,
+		},
+		{
+			name:    "label cfg with empty key errors",
+			cfg:     &apiv1alpha1.ResourceConfig{Label: &apiv1alpha1.LabelConfig{Key: "", Value: "production"}},
+			wantErr: true,
+		},
+		{
+			name:    "label cfg with empty value errors",
+			cfg:     &apiv1alpha1.ResourceConfig{Label: &apiv1alpha1.LabelConfig{Key: "env", Value: ""}},
+			wantErr: true,
+		},
+		{
+			name:    "empty cfg errors",
+			cfg:     &apiv1alpha1.ResourceConfig{},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rmf, err := determineResourceMatchFunc(tc.cfg, tc.requested)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				if rmf != nil {
+					t.Errorf("expected nil matcher on error, got non-nil")
+				}
+				return
+			}
+			if got := rmf(tc.resource); got != tc.wantMatch {
+				t.Errorf("match = %v, want %v", got, tc.wantMatch)
+			}
+		})
+	}
+}
+
+func TestComponentMatchFunc(t *testing.T) {
+	r := &resolver{serviceProvider: "sp-test"}
+	defaultKey := defaultComponentLabel("sp-test")
+
+	labelled := func(key, value string) Component {
+		v, _ := json.Marshal(value)
+		return Component{Labels: []v2.Label{{Name: key, Value: v}}}
+	}
+
+	tests := []struct {
+		name       string
+		discConfig apiv1alpha1.DiscoveryConfig
+		component  string
+		target     Component
+		wantNil    bool
+		wantMatch  bool
+	}{
+		{
+			name:      "empty component returns nil matcher",
+			component: "",
+			wantNil:   true,
+		},
+		{
+			name:      "default label key matches component",
+			component: "provider-btp",
+			target:    labelled(defaultKey, "provider-btp"),
+			wantMatch: true,
+		},
+		{
+			name:      "default label key rejects other component",
+			component: "provider-btp",
+			target:    labelled(defaultKey, "provider-kubernetes"),
+			wantMatch: false,
+		},
+		{
+			name:       "custom label key matches component",
+			discConfig: apiv1alpha1.DiscoveryConfig{ComponentMatchLabelKey: "custom.io/name"},
+			component:  "provider-btp",
+			target:     labelled("custom.io/name", "provider-btp"),
+			wantMatch:  true,
+		},
+		{
+			name:       "custom label key ignores default key",
+			discConfig: apiv1alpha1.DiscoveryConfig{ComponentMatchLabelKey: "custom.io/name"},
+			component:  "provider-btp",
+			target:     labelled(defaultKey, "provider-btp"),
+			wantMatch:  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmf, err := r.componentMatchFunc(tc.discConfig, ResolveOptions{ComponentLabel: tc.component})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.wantNil {
+				if cmf != nil {
+					t.Errorf("expected nil matcher, got non-nil")
+				}
+				return
+			}
+			if cmf == nil {
+				t.Fatalf("expected non-nil matcher")
+			}
+			if got := cmf(tc.target); got != tc.wantMatch {
+				t.Errorf("match = %v, want %v", got, tc.wantMatch)
+			}
+		})
+	}
+}
+
+func TestOCIRepoFromComponent(t *testing.T) {
+	rawJSON := func(m map[string]any) []byte {
+		data, err := json.Marshal(m)
+		if err != nil {
+			t.Fatalf("marshal repositorySpec: %v", err)
+		}
+		return data
+	}
+	component := func(raw []byte) *ocmv1alpha1.Component {
+		var spec *apiextensionsv1.JSON
+		if raw != nil {
+			spec = &apiextensionsv1.JSON{Raw: raw}
+		}
+		return &ocmv1alpha1.Component{
+			Status: ocmv1alpha1.ComponentStatus{
+				Component: ocmv1alpha1.ComponentInfo{RepositorySpec: spec},
+			},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		component   *ocmv1alpha1.Component
+		wantBaseUrl string
+		wantErr     bool
+	}{
+		{
+			name:      "missing repositorySpec errors",
+			component: component(nil),
+			wantErr:   true,
+		},
+		{
+			name:      "invalid JSON errors",
+			component: component([]byte("not-json")),
+			wantErr:   true,
+		},
+		{
+			name:      "unregistered type errors",
+			component: component(rawJSON(map[string]any{"type": "BogusRepository", "baseUrl": "ghcr.io"})),
+			wantErr:   true,
+		},
+		{
+			name:        "valid OCIRepository returns baseURL",
+			component:   component(rawJSON(map[string]any{"type": "OCIRepository", "baseUrl": "ghcr.io/org"})),
+			wantBaseUrl: "ghcr.io/org",
+		},
+		{
+			name:        "legacy OCIRegistry type is accepted",
+			component:   component(rawJSON(map[string]any{"type": "OCIRegistry", "baseUrl": "ghcr.io/legacy"})),
+			wantBaseUrl: "ghcr.io/legacy",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, err := ociRepoFromComponent(tc.component)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if repo.BaseUrl != tc.wantBaseUrl {
+				t.Errorf("BaseUrl = %q, want %q", repo.BaseUrl, tc.wantBaseUrl)
 			}
 		})
 	}

@@ -30,7 +30,7 @@ type SelectorConfig struct {
 	ResourceSelector *ocmv1alpha1.Selector `json:"resourceSelector,omitempty"`
 }
 
-type ComponentConfig struct {
+type DiscoveryConfig struct {
 	// +kubebuilder:validation:Optional
 	SelectorConfig *SelectorConfig `json:"selectorConfig,omitempty"`
 	// +kubebuilder:validation:Optional
