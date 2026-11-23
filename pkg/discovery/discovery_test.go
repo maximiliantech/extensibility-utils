@@ -68,10 +68,9 @@ func TestComponentDescriptorBase(t *testing.T) {
 	suffix := "/" + ocmpath.DefaultComponentDescriptorPath
 
 	tests := []struct {
-		name    string
-		repo    ocirepov1.Repository
-		want    string
-		wantErr bool
+		name string
+		repo ocirepov1.Repository
+		want string
 	}{
 		{
 			name: "plain host",
@@ -108,8 +107,8 @@ func TestComponentDescriptorBase(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := componentDescriptorBase(&tc.repo)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("error = %v, wantErr %v", err, tc.wantErr)
+			if err != nil {
+				t.Fatalf("error = %v", err)
 			}
 			if got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
@@ -218,6 +217,12 @@ func TestFindComponent(t *testing.T) {
 			wantFound: true,
 		},
 		{
+			name:      "normalized matching",
+			version:   "2.0.0",
+			wantName:  "ghcr.io/org/comp-a",
+			wantFound: true,
+		},
+		{
 			name:      "version mismatch returns not found",
 			matchFunc: matchLabel("comp-a"),
 			version:   "v9.0.0",
@@ -239,6 +244,9 @@ func TestFindComponent(t *testing.T) {
 			}
 			if ok && got.Name != tc.wantName {
 				t.Errorf("got name %q, want %q", got.Name, tc.wantName)
+			}
+			if ok && normalizeVersion(got.Version) != normalizeVersion(tc.version) {
+				t.Errorf("got version %q, want %q", got.Version, tc.version)
 			}
 		})
 	}
@@ -266,7 +274,12 @@ func TestFindResource(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:          "matching resource is returned",
+			name:          "matching resource by type",
+			matchFunc:     resourceByType("image"),
+			wantAccessURL: "ghcr.io/test-image:v1.0.0",
+		},
+		{
+			name:          "matching resource by name",
 			matchFunc:     resourceByName("test-image"),
 			wantAccessURL: "ghcr.io/test-image:v1.0.0",
 		},
@@ -343,8 +356,8 @@ func TestDecodeAccess(t *testing.T) {
 	}{
 		{
 			name:    "OCIImage returns image reference",
-			access:  mustRaw(t, "registry.example.com/img:v1.0"),
-			wantURL: "registry.example.com/img:v1.0",
+			access:  mustRaw(t, "ghcr.io/test-image:v1.0"),
+			wantURL: "ghcr.io/test-image:v1.0",
 		},
 		{
 			name:    "LocalBlob without GlobalAccess builds URL from basePath",
@@ -353,8 +366,8 @@ func TestDecodeAccess(t *testing.T) {
 		},
 		{
 			name:    "LocalBlob with GlobalAccess returns global image reference",
-			access:  mustLocalBlobRaw(t, "sha256:abc123", "registry.example.com/global:v1.0"),
-			wantURL: "registry.example.com/global:v1.0",
+			access:  mustLocalBlobRaw(t, "sha256:abc123", "ghcr.io/global:v1.0"),
+			wantURL: "ghcr.io/global:v1.0",
 		},
 		{
 			name:    "nil access returns error",
@@ -574,14 +587,14 @@ func TestComponentMatchFunc(t *testing.T) {
 		},
 		{
 			name:       "custom label key matches component",
-			discConfig: apiv1alpha1.DiscoveryConfig{ComponentMatchLabelKey: "custom.io/name"},
+			discConfig: apiv1alpha1.DiscoveryConfig{ComponentMatchLabelKey: "open-control-plane.io/name"},
 			component:  "provider-btp",
 			target:     labelled("custom.io/name", "provider-btp"),
 			wantMatch:  true,
 		},
 		{
 			name:       "custom label key ignores default key",
-			discConfig: apiv1alpha1.DiscoveryConfig{ComponentMatchLabelKey: "custom.io/name"},
+			discConfig: apiv1alpha1.DiscoveryConfig{ComponentMatchLabelKey: "open-control-plane.io/name"},
 			component:  "provider-btp",
 			target:     labelled(defaultKey, "provider-btp"),
 			wantMatch:  false,
@@ -648,7 +661,7 @@ func TestOCIRepoFromComponent(t *testing.T) {
 		},
 		{
 			name:      "unregistered type errors",
-			component: component(rawJSON(map[string]any{"type": "BogusRepository", "baseUrl": "ghcr.io"})),
+			component: component(rawJSON(map[string]any{"type": "UnregisteredTypeRepository", "baseUrl": "ghcr.io/org"})),
 			wantErr:   true,
 		},
 		{
