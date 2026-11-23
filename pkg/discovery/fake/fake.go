@@ -15,21 +15,11 @@ import (
 )
 
 type Resolver struct {
-	applyRequeue  bool
-	deleteRequeue bool
-	secret        *corev1.LocalObjectReference
-	discoveries   map[string][]Component
-
-	// serviceProvider mirrors Config.ServiceProvider: it determines the default
-	// component label key (see discovery.DefaultComponentLabelKey) used when a
-	// DiscoveryConfig does not override it via ComponentMatchLabelKey.
-	serviceProvider string
-	// discoveryConfigs mirrors Config.DiscoveryConfigs. Resolve and ListComponentVersions
-	// require the requested discovery ID to have an entry here, mirroring the real resolver
-	// which errors with "failed to find discovery id" for an ID absent from its configs.
-	// Within an entry, unset fields fall back to the resolver defaults: a component is
-	// matched by the default label key (overridable via ComponentMatchLabelKey) and a
-	// resource is matched by its type (overridable via ResourceConfig).
+	applyRequeue     bool
+	deleteRequeue    bool
+	secret           *corev1.LocalObjectReference
+	discoveries      map[string][]Component
+	serviceProvider  string
 	discoveryConfigs map[string]apiv1alpha1.DiscoveryConfig
 
 	// Errors to return from the respective interface methods.
@@ -40,11 +30,11 @@ type Resolver struct {
 	listVersionsErr error
 
 	// Override the respective fake behavior entirely when set.
-	ApplyFunc        func(ctx context.Context) (bool, error)
-	DeleteFunc       func(ctx context.Context) (bool, error)
-	CredentialsFunc  func(ctx context.Context) (*corev1.LocalObjectReference, error)
-	ResolveFunc      func(ctx context.Context, discID, requestedResource, version string, opts ...discovery.ResolveOption) (string, error)
-	ListVersionsFunc func(ctx context.Context, discID string, opts ...discovery.ResolveOption) ([]string, error)
+	ApplyFunc                 func(ctx context.Context) (bool, error)
+	DeleteFunc                func(ctx context.Context) (bool, error)
+	CredentialsFunc           func(ctx context.Context) (*corev1.LocalObjectReference, error)
+	ResolveFunc               func(ctx context.Context, discID, requestedResource, version string, opts ...discovery.ResolveOption) (string, error)
+	ListComponentVersionsFunc func(ctx context.Context, discID string, opts ...discovery.ResolveOption) ([]string, error)
 }
 
 type Component struct {
@@ -67,22 +57,25 @@ func NewResolver() *Resolver {
 	return &Resolver{}
 }
 
+// WithCrendetials sets the applies requeue value.
 func (f *Resolver) WithApplyRequeue(requeue bool) *Resolver {
 	f.applyRequeue = requeue
 	return f
 }
 
+// WithCrendetials sets the deletes requeue value.
 func (f *Resolver) WithDeleteRequeue(requeue bool) *Resolver {
 	f.deleteRequeue = requeue
 	return f
 }
 
+// WithCrendetials sets the reference to the secret carrying the credentials.
 func (f *Resolver) WithCredentials(secret *corev1.LocalObjectReference) *Resolver {
 	f.secret = secret
 	return f
 }
 
-// WithComponents registers the components discovered under the given discovery ID.
+// WithComponents registers the components under the given discovery ID.
 func (f *Resolver) WithComponents(discID string, components []Component) *Resolver {
 	if f.discoveries == nil {
 		f.discoveries = map[string][]Component{}
@@ -91,15 +84,13 @@ func (f *Resolver) WithComponents(discID string, components []Component) *Resolv
 	return f
 }
 
-// WithServiceProvider sets the service provider name used to derive the default
-// component label key, mirroring Config.ServiceProvider on the real resolver.
+// WithServiceProvider sets the service provider name used to derive the default component label key.
 func (f *Resolver) WithServiceProvider(name string) *Resolver {
 	f.serviceProvider = name
 	return f
 }
 
-// WithDiscoveryConfig registers the DiscoveryConfig for a discovery ID so the fake
-// honors its ComponentMatchLabelKey and ResourceConfig, mirroring Config.DiscoveryConfigs.
+// WithDiscoveryConfig registers the DiscoveryConfig for a discovery ID.
 func (f *Resolver) WithDiscoveryConfig(discID string, cfg apiv1alpha1.DiscoveryConfig) *Resolver {
 	if f.discoveryConfigs == nil {
 		f.discoveryConfigs = map[string]apiv1alpha1.DiscoveryConfig{}
@@ -108,27 +99,32 @@ func (f *Resolver) WithDiscoveryConfig(discID string, cfg apiv1alpha1.DiscoveryC
 	return f
 }
 
+// WithApplyError sets the error for Apply.
 func (f *Resolver) WithApplyError(err error) *Resolver {
 	f.applyErr = err
 	return f
 }
 
+// WithApplyError sets the error for Delete.
 func (f *Resolver) WithDeleteError(err error) *Resolver {
 	f.deleteErr = err
 	return f
 }
 
+// WithApplyError sets the error for Credentials.
 func (f *Resolver) WithCredentialsError(err error) *Resolver {
 	f.credentialsErr = err
 	return f
 }
 
+// WithApplyError sets the error for Resolve.
 func (f *Resolver) WithResolveError(err error) *Resolver {
 	f.resolveErr = err
 	return f
 }
 
-func (f *Resolver) WithListVersionsError(err error) *Resolver {
+// WithApplyError sets the error for ListComponentVersions.
+func (f *Resolver) WithListComponentsVersionsError(err error) *Resolver {
 	f.listVersionsErr = err
 	return f
 }
@@ -170,7 +166,8 @@ func (f *Resolver) Resolve(ctx context.Context, discID, requestedResource, versi
 	if f.ResolveFunc != nil {
 		return f.ResolveFunc(ctx, discID, requestedResource, version, opts...)
 	}
-	if _, ok := f.discoveryConfigs[discID]; !ok {
+	_, ok := f.discoveryConfigs[discID]
+	if !ok {
 		return "", fmt.Errorf("failed to find discovery id %q", discID)
 	}
 	requestedComponent := discovery.ApplyResolveOptions(opts...).ComponentLabel
@@ -181,10 +178,12 @@ func (f *Resolver) Resolve(ctx context.Context, discID, requestedResource, versi
 		if !f.componentMatches(discID, c, requestedComponent) {
 			continue
 		}
-		// First component matching version (and optional component filter) wins,
-		// mirroring the real resolver's findComponent.
+		matches, err := f.resourceMatcher(discID, requestedResource)
+		if err != nil {
+			return "", err
+		}
 		for _, r := range c.Resources {
-			if f.resourceMatches(discID, r, requestedResource) {
+			if matches(r) {
 				return r.AccessURL, nil
 			}
 		}
@@ -197,10 +196,11 @@ func (f *Resolver) ListComponentVersions(ctx context.Context, discID string, opt
 	if f.listVersionsErr != nil {
 		return nil, f.listVersionsErr
 	}
-	if f.ListVersionsFunc != nil {
-		return f.ListVersionsFunc(ctx, discID, opts...)
+	if f.ListComponentVersionsFunc != nil {
+		return f.ListComponentVersionsFunc(ctx, discID, opts...)
 	}
-	if _, ok := f.discoveryConfigs[discID]; !ok {
+	_, ok := f.discoveryConfigs[discID]
+	if !ok {
 		return nil, fmt.Errorf("failed to find discovery id %q", discID)
 	}
 	requestedComponent := discovery.ApplyResolveOptions(opts...).ComponentLabel
@@ -214,40 +214,34 @@ func (f *Resolver) ListComponentVersions(ctx context.Context, discID string, opt
 	return versions, nil
 }
 
-// componentMatches mirrors resolver.componentMatchFunc: with no component filter every
-// component matches; otherwise the component must carry the resolved label key with the
-// requested value. The key defaults to discovery.DefaultComponentLabelKey(serviceProvider)
-// and is overridden by the discovery's ComponentMatchLabelKey when configured.
 func (f *Resolver) componentMatches(discID string, c Component, componentLabel string) bool {
 	if componentLabel == "" {
 		return true
 	}
 	key := discovery.DefaultComponentLabelKey(f.serviceProvider)
-	if cfg, ok := f.discoveryConfigs[discID]; ok && cfg.ComponentMatchLabelKey != "" {
+	cfg, ok := f.discoveryConfigs[discID]
+	if ok && cfg.ComponentMatchLabelKey != "" {
 		key = cfg.ComponentMatchLabelKey
 	}
 	return labelHasValue(c.Labels, key, componentLabel)
 }
 
-// resourceMatches mirrors resolver.determineResourceMatchFunc. Without a ResourceConfig
-// entry for the requested resource the match is by Type; a configured entry selects by
-// Name, ResourceType, or Label (key+value) instead, in that precedence.
-func (f *Resolver) resourceMatches(discID string, r Resource, requested string) bool {
+func (f *Resolver) resourceMatcher(discID, requested string) (func(Resource) bool, error) {
 	cfg, ok := f.resourceConfig(discID, requested)
 	switch {
 	case !ok:
-		return r.Type == requested
+		return func(r Resource) bool { return r.Type == requested }, nil
 	case cfg.Name != "":
-		return r.Name == cfg.Name
+		return func(r Resource) bool { return r.Name == cfg.Name }, nil
 	case cfg.ResourceType != "":
-		return r.Type == cfg.ResourceType
+		return func(r Resource) bool { return r.Type == cfg.ResourceType }, nil
 	case cfg.Label != nil:
 		if cfg.Label.Key == "" || cfg.Label.Value == "" {
-			return false
+			return nil, fmt.Errorf("LabelConfig key and value must be set")
 		}
-		return labelHasValue(r.Labels, cfg.Label.Key, cfg.Label.Value)
+		return func(r Resource) bool { return labelHasValue(r.Labels, cfg.Label.Key, cfg.Label.Value) }, nil
 	default:
-		return false
+		return nil, fmt.Errorf("no resource match func could be determined")
 	}
 }
 
@@ -260,8 +254,6 @@ func (f *Resolver) resourceConfig(discID, requested string) (apiv1alpha1.Resourc
 	return rc, ok
 }
 
-// labelHasValue reports whether labels carries key with a value equal to the JSON
-// encoding of value, mirroring the real resolver's bytes.Equal(label.Value, marshaled) check.
 func labelHasValue(labels map[string]json.RawMessage, key, value string) bool {
 	encoded, err := json.Marshal(value)
 	if err != nil {
