@@ -48,34 +48,21 @@ Utilities for managing Kubernetes secrets across clusters.
 
 Utilities to resolve OCM (Open Component Model) components and resources from `Discovery` objects on a release channel umbrella component.
 
-**Key Types:**
-- `Resolver`: Main interface for managing `Discovery` objects and resolving resources (Apply, Credentials, Resolve, ListComponentVersions)
-- `Config`: Configuration for `NewResolver` (service provider, namespace, base component, discovery configs)
-- `Component`: A parsed OCM component descriptor entry (name, version, resources, labels)
-- `Resource`: A resolved OCM resource with a fully-qualified OCI access URL
-
-**Resolver Methods:**
-- `Apply()`: Create or update the `Discovery` objects on the platform cluster, returning true if a requeue is needed
-- `Delete()`: Delete the `Discovery` objects on the platform cluster, returning true if a requeue is needed
-- `Credentials()`: Return a reference to the first docker-config secret in the base component's effective OCM config, or nil if none exists
-- `Resolve()`: Fetch the `Discovery` for a given id, find the component matching the version (optionally restricted via `WithComponentLabel`), then return the access URL of the first resource matching the `resourceIdentifier`
-- `ListComponentVersions()`: Return the available component versions for a given id (optionally restricted via `WithComponentLabel`), sorted oldest first
-
 A `fake.Resolver` (`pkg/discovery/fake`) is provided for testing consumers of the `Resolver` interface.
 
 #### Usage
 
 **1. Create a resolver**
 
-`NewResolver` takes a `Config` whose central field is the per-discovery `DiscoveryConfig` map. It configures how each `Discovery` object is laid out and how its components and resources are matched. Creating the resolver also fetches the base (umbrella) component and computes the OCI base path shared by all resolved resources; it fails if the base component cannot be found.
+`NewResolver` takes a `Config` whose central field is the per-discovery `DiscoveryConfig` map. It configures how each `Discovery` object is laid out and how its components and resources are matched. Creating the resolver also fetches the base (umbrella) component and computes the OCI base path shared by all resolved resources. It fails if the base component cannot be found.
 
 **2. Apply/Delete the Discovery objects**
 
-`Apply` creates or updates the `Discovery` objects on the platform cluster; `Delete` removes them. Both return a `requeue` bool: `true` means the objects are not settled yet and reconciliation should run again. Resolve only works once the relevant `Discovery` is applied and ready.
+`Apply` creates or updates the `Discovery` objects on the platform cluster and `Delete` removes them. Both return a `requeue` bool: `true` means the objects are not settled yet and reconciliation should run again. Resolve only works once the relevant `Discovery` is applied and ready.
 
 **3. Resolve resources**
 
-`Resolve` returns the OCI access URL of a single resource from the components in a discovery. `ListComponentVersions` returns the matching components' versions, sorted oldest first; it uses the same component matching as `Resolve`.
+`AccessURL` returns the OCI access URL of a single resource from the components in a discovery. `ListComponentVersions` returns the matching components versions, sorted oldest first. It uses the same component matching as `AccessURL`.
 
 `Credentials` returns a reference to the first `kubernetes.io/dockerconfigjson` secret listed in the base component's effective OCM config (looked up in each entry's namespace, falling back to the resolver's namespace). It returns `nil` when no such secret exists, and only returns an error if it never found one *and* at least one lookup failed along the way.
 
@@ -85,7 +72,7 @@ Resolution happens in two stages: first a component is selected within the disco
 
 **Component matching**
 
-By default components are matched by `version` alone. If the version is not enough to identify a single component, pass `WithComponentLabel(value)` to `Resolve` / `ListComponentVersions`. The `value` is then matched against a component label:
+By default components are matched by `version` alone. If the version is not enough to identify a single component, pass `WithComponentLabel(value)` to `AccessURL` / `ListComponentVersions`. The `value` is then matched against a component label:
 
 | Label key used | When |
 | --- | --- |
@@ -94,7 +81,7 @@ By default components are matched by `version` alone. If the version is not enou
 
 **Resource matching**
 
-The `resourceIdentifier` you pass to `Resolve` (e.g. `"image"`, `"helmChart"`) is, by default, matched against each resource's **type**. To change what it matches against, add an entry under `DiscoveryConfig.ResourceConfig` keyed by that identifier. Each entry sets exactly one of the following:
+The `resourceIdentifier` you pass to `AccessURL` (e.g. `"image"`, `"helmChart"`) is, by default, matched against each resource's **type**. To change what it matches against, add an entry under `DiscoveryConfig.ResourceConfig` keyed by that identifier. Each entry sets exactly one of the following:
 
 | `ResourceConfig[identifier]` field | Resource is matched by |
 | --- | --- |
@@ -103,30 +90,30 @@ The `resourceIdentifier` you pass to `Resolve` (e.g. `"image"`, `"helmChart"`) i
 | `resourceType` | resource **type** equals this value |
 | `label` | resource has a label with this `key` and `value` |
 
-The map key is the identifier you will pass to `Resolve`. It is only a lookup handle to find the applicable config and is *not* itself compared against anything on the resource. The chosen field then decides what the resource is actually matched against. This lets a caller-facing identifier differ from how the resource is named or typed in the component.
+The map key is the identifier you will pass to `AccessURL`. It is only a lookup handle to find the applicable config and is *not* itself compared against anything on the resource. The chosen field then decides what the resource is actually matched against. This lets a caller-facing identifier differ from how the resource is named or typed in the component.
 
 For example, given this `DiscoveryConfig`:
 
 ```go
 apiv1alpha1.DiscoveryConfig{
     ResourceConfig: map[string]apiv1alpha1.ResourceConfig{
-        // Resolve(ctx, discID, "image", version) matches the resource whose type == "ociImage"
+        // AccessURL(ctx, discID, "image", version) matches the resource whose type == "ociImage"
         "image": {ResourceType: "ociImage"},
 
-        // Resolve(ctx, discID, "chart", version) matches the resource whose name == "my-helm-chart"
+        // AccessURL(ctx, discID, "chart", version) matches the resource whose name == "my-helm-chart"
         "chart": {Name: "my-helm-chart"},
 
-        // Resolve(ctx, discID, "operator", version) matches the resource carrying
+        // AccessURL(ctx, discID, "operator", version) matches the resource carrying
         // the label role=operator
         "operator": {Label: &apiv1alpha1.LabelConfig{Key: "role", Value: "operator"}},
     },
 }
 ```
 
-- `Resolve(ctx, discID, "image", version)` → first resource with `type == "ociImage"`.
-- `Resolve(ctx, discID, "chart", version)` → first resource with `name == "my-helm-chart"`.
-- `Resolve(ctx, discID, "operator", version)` → first resource with a label `role` whose value is `operator`.
-- `Resolve(ctx, discID, "helmChart", version)` → no entry for `"helmChart"`, so it falls back to matching `type == "helmChart"`.
+- `AccessURL(ctx, discID, "image", version)` → first resource with `type == "ociImage"`.
+- `AccessURL(ctx, discID, "chart", version)` → first resource with `name == "my-helm-chart"`.
+- `AccessURL(ctx, discID, "operator", version)` → first resource with a label `role` whose value is `operator`.
+- `AccessURL(ctx, discID, "helmChart", version)` → no entry for `"helmChart"`, so it falls back to matching `type == "helmChart"`.
 
 Note that `name`, `resourceType`, and `label` are mutually exclusive per entry: the config is validated to carry exactly one of them, and an entry with a `label` missing its `key` or `value` is rejected.
 

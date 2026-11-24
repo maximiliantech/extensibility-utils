@@ -25,6 +25,7 @@ import (
 	ocmpath "ocm.software/open-component-model/bindings/go/oci/spec/repository/path"
 	"ocm.software/open-component-model/bindings/go/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1alpha1 "github.com/openmcp-project/extensibility-utils/pkg/discovery/api/v1alpha1"
 	"github.com/openmcp-project/extensibility-utils/pkg/objectmanager"
@@ -52,7 +53,7 @@ var (
 )
 
 // ResourceIdentifier identifies the kind of resource which should be resolved from a component.
-type ResourceIdentifier = string
+type ResourceIdentifier string
 
 const (
 	TypeImage ResourceIdentifier = "image"
@@ -67,8 +68,8 @@ type Resolver interface {
 	Delete(ctx context.Context) (bool, error)
 	// Credentials returns a reference to the first docker-config secret found on the base components effective OCM config, or nil if none exists.
 	Credentials(ctx context.Context) (*corev1.LocalObjectReference, error)
-	// Resolve fetches the Discovery for discID, finds the component matching version (optionally restricted via WithComponentLabel), then returns the first resource matching resourceIdentifier.
-	Resolve(ctx context.Context, discID string, resourceIdentifier ResourceIdentifier, version string, opts ...ResolveOption) (string, error)
+	// AccessURL fetches the Discovery for discID, finds the component matching version (optionally restricted via WithComponentLabel), then returns the first resource matching resourceIdentifier.
+	AccessURL(ctx context.Context, discID string, resourceIdentifier ResourceIdentifier, version string, opts ...ResolveOption) (string, error)
 	// ListComponentVersions returns the available component versions for discID (optionally restricted via WithComponentLabel) sorted oldest first.
 	ListComponentVersions(ctx context.Context, discID string, opts ...ResolveOption) ([]string, error)
 }
@@ -79,11 +80,11 @@ type ResolveOptions struct {
 	ComponentLabel string
 }
 
-// ResolveOption configures Options for a Resolver operation.
+// ResolveOption configures ResolveOptions for a Resolver operation.
 type ResolveOption func(*ResolveOptions)
 
-// ApplyResolveOptions resolves opts into an Options value.
-func ApplyResolveOptions(opts ...ResolveOption) ResolveOptions {
+// applyResolveOptions resolves opts into a ResolveOptions value.
+func applyResolveOptions(opts ...ResolveOption) ResolveOptions {
 	var o ResolveOptions
 	for _, opt := range opts {
 		opt(&o)
@@ -102,9 +103,8 @@ type resolver struct {
 	cluster               *clusters.Cluster
 	serviceProvider       string
 	namespace             string
-	baseComponent         ocmv1alpha1.Component
 	discoveryConfigs      map[string]apiv1alpha1.DiscoveryConfig
-	basePath              string
+	baseComponentName     string
 	defaultComponentLabel string
 }
 
@@ -135,13 +135,6 @@ func defaultComponentLabel(providerName string) string {
 	return fmt.Sprintf("%s.services.open-control-plane.io/%s", providerName, "component")
 }
 
-// DefaultComponentLabelKey returns the label key used to match components via WithComponent
-// when a DiscoveryConfig does not override it through ComponentMatchLabelKey.
-// It is exported so test doubles can reproduce the resolver's default component matching.
-func DefaultComponentLabelKey(providerName string) string {
-	return defaultComponentLabel(providerName)
-}
-
 func defaultComponentSelector(providerName string, componentType string) *ocmv1alpha1.Selector {
 	s := ocmv1alpha1.Selector{
 		MatchLabels: map[string]string{
@@ -152,24 +145,15 @@ func defaultComponentSelector(providerName string, componentType string) *ocmv1a
 }
 
 // NewResolver creates a Resolver by fetching the base component and computing its OCI base path.
-func NewResolver(ctx context.Context, cfg Config, c *clusters.Cluster) (Resolver, error) {
-	baseComponent, err := fetchBaseComponent(ctx, c.Cluster().GetClient(), cfg.BaseComponent, cfg.Namespace)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch base component: %w", err)
-	}
-	basePath, err := computeBasePath(baseComponent)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compute base path: %w", err)
-	}
+func NewResolver(cfg Config, c *clusters.Cluster) Resolver {
 	return &resolver{
 		cluster:               c,
 		serviceProvider:       cfg.ServiceProvider,
 		namespace:             cfg.Namespace,
-		baseComponent:         baseComponent,
 		discoveryConfigs:      cfg.DiscoveryConfigs,
-		basePath:              basePath,
+		baseComponentName:     cfg.BaseComponent,
 		defaultComponentLabel: defaultComponentLabel(cfg.ServiceProvider),
-	}, nil
+	}
 }
 
 func fetchBaseComponent(ctx context.Context, reader client.Reader, name string, namespace string) (ocmv1alpha1.Component, error) {
@@ -186,8 +170,12 @@ func fetchBaseComponent(ctx context.Context, reader client.Reader, name string, 
 
 // Apply builds the Discovery objects and creates/updates them on the platform cluster. It returns true when a requeue is needed.
 func (r *resolver) Apply(ctx context.Context) (bool, error) {
+	baseComponent, err := fetchBaseComponent(ctx, r.cluster.Cluster().GetClient(), r.baseComponentName, r.namespace)
+	if err != nil {
+		return false, fmt.Errorf("failed to fetch base component: %w", err)
+	}
 	platformCluster := objectmanager.NewCluster(r.cluster, r.namespace, objectmanager.PlatformCluster)
-	manageDiscoveries(r.discoveryConfigs, r.namespace, platformCluster, r.serviceProvider, r.baseComponent.Name)
+	manageDiscoveries(r.discoveryConfigs, r.namespace, platformCluster, r.serviceProvider, baseComponent.Name)
 	mgr := objectmanager.NewManager(r.serviceProvider)
 	mgr.AddCluster(platformCluster)
 	rr, err := mgr.Apply(ctx)
@@ -199,8 +187,12 @@ func (r *resolver) Apply(ctx context.Context) (bool, error) {
 
 // Delete builds the Discovery objects and deletes them on the platform cluster. It returns true when a requeue is needed.
 func (r *resolver) Delete(ctx context.Context) (bool, error) {
+	baseComponent, err := fetchBaseComponent(ctx, r.cluster.Cluster().GetClient(), r.baseComponentName, r.namespace)
+	if err != nil {
+		return false, fmt.Errorf("failed to fetch base component: %w", err)
+	}
 	platformCluster := objectmanager.NewCluster(r.cluster, r.namespace, objectmanager.PlatformCluster)
-	manageDiscoveries(r.discoveryConfigs, r.namespace, platformCluster, r.serviceProvider, r.baseComponent.Name)
+	manageDiscoveries(r.discoveryConfigs, r.namespace, platformCluster, r.serviceProvider, baseComponent.Name)
 	mgr := objectmanager.NewManager(r.serviceProvider)
 	mgr.AddCluster(platformCluster)
 	rr, err := mgr.Delete(ctx)
@@ -274,7 +266,11 @@ func discoveryStatus(object client.Object) objectmanager.ManagedObjectStatus {
 // Credentials fetches the effective OCM config on the base component and returns the first secret of type SecretTypeDockerConfigJson
 func (r *resolver) Credentials(ctx context.Context) (*corev1.LocalObjectReference, error) {
 	reader := r.cluster.Cluster().GetClient()
-	configs := r.baseComponent.GetEffectiveOCMConfig()
+	baseComponent, err := fetchBaseComponent(ctx, reader, r.baseComponentName, r.namespace)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch base component: %w", err)
+	}
+	configs := baseComponent.GetEffectiveOCMConfig()
 	var fetchErrs []error
 	for _, config := range configs {
 		if config.Kind != "Secret" {
@@ -291,6 +287,7 @@ func (r *resolver) Credentials(ctx context.Context) (*corev1.LocalObjectReferenc
 			continue
 		}
 		if secret.Type != corev1.SecretTypeDockerConfigJson {
+			log.FromContext(ctx).WithValues("name", secret.Name, "namespace", secret.Namespace).V(1).Info("secret skipped as it is not type dockerconfigjson")
 			continue
 		}
 		return &corev1.LocalObjectReference{Name: config.Name}, nil
@@ -316,7 +313,7 @@ func (r *resolver) ListComponentVersions(ctx context.Context, discID string, opt
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse discovery %q: %w", discID, err)
 	}
-	cmf, err := r.componentMatchFunc(discConfig, ApplyResolveOptions(opts...))
+	cmf, err := r.componentMatchFunc(discConfig, applyResolveOptions(opts...))
 	if err != nil {
 		return nil, err
 	}
@@ -377,16 +374,24 @@ func CompareVersions(a, b string) int {
 	}
 }
 
-// Resolve looks up a single resource from the components in the Discovery.
+// AccessURL looks up a single resource from the components in the Discovery.
 // It selects the component by versions, ignoring any leading "v".
 // Pass WithComponent if the version is not enough to uniquely identify a component in the Discovery.
 // By default the resourceIdentifier is matched against the type of the resource.
 // Use the Discoveries ResourceConfig entry to match another attribute.
 // It returns ErrComponentNotFound if no component matches and ErrResourceNotFound if the component has no matching resource.
-func (r *resolver) Resolve(ctx context.Context, discID string, resourceIdentifier ResourceIdentifier, version string, opts ...ResolveOption) (string, error) {
+func (r *resolver) AccessURL(ctx context.Context, discID string, resourceIdentifier ResourceIdentifier, version string, opts ...ResolveOption) (string, error) {
 	discConfig, ok := r.discoveryConfigs[discID]
 	if !ok {
 		return "", fmt.Errorf("failed to find discovery id %q", discID)
+	}
+	baseComponent, err := fetchBaseComponent(ctx, r.cluster.Cluster().GetClient(), r.baseComponentName, r.namespace)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch base component: %w", err)
+	}
+	basePath, err := computeBasePath(baseComponent)
+	if err != nil {
+		return "", fmt.Errorf("failed to compute base path: %w", err)
 	}
 	discovery, err := r.fetchDiscovery(ctx, discID)
 	if err != nil {
@@ -396,7 +401,7 @@ func (r *resolver) Resolve(ctx context.Context, discID string, resourceIdentifie
 	if err != nil {
 		return "", fmt.Errorf("failed to parse discovery %q: %w", discID, err)
 	}
-	cmf, err := r.componentMatchFunc(discConfig, ApplyResolveOptions(opts...))
+	cmf, err := r.componentMatchFunc(discConfig, applyResolveOptions(opts...))
 	if err != nil {
 		return "", err
 	}
@@ -405,15 +410,15 @@ func (r *resolver) Resolve(ctx context.Context, discID string, resourceIdentifie
 		return "", fmt.Errorf("failed to find component for version %q: %w", version, ErrComponentNotFound)
 	}
 	var rcPtr *apiv1alpha1.ResourceConfig
-	rc, ok := discConfig.ResourceConfig[resourceIdentifier]
+	rc, ok := discConfig.ResourceConfig[string(resourceIdentifier)]
 	if ok {
 		rcPtr = &rc
 	}
-	resourceMatchFunc, err := determineResourceMatchFunc(rcPtr, resourceIdentifier)
+	resourceMatchFunc, err := determineResourceMatchFunc(rcPtr, string(resourceIdentifier))
 	if err != nil {
 		return "", fmt.Errorf("failed to determine resource match func: %w", err)
 	}
-	resource, err := findResource(discoveredComponent, r.basePath, resourceMatchFunc)
+	resource, err := findResource(discoveredComponent, basePath, resourceMatchFunc)
 	if err != nil {
 		return "", fmt.Errorf("failed to find resource in discovery %q: %w", discID, err)
 	}
@@ -589,7 +594,8 @@ func ociRepoFromComponent(component *ocmv1alpha1.Component) (*ocirepov1.Reposito
 	}
 
 	raw := &runtime.Raw{}
-	if err := json.Unmarshal(componentInfo.RepositorySpec.Raw, raw); err != nil {
+	err := json.Unmarshal(componentInfo.RepositorySpec.Raw, raw)
+	if err != nil {
 		return nil, fmt.Errorf("failed to decode repositorySpec: %w", err)
 	}
 
